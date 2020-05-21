@@ -1,65 +1,330 @@
-#include <stdio.h>
-#include <ctype.h>
-#include <dirent.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <string.h>
-#include <time.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#define FORMAT "%5s %s\t%8s %s\n"
+/// @file server.c
+/// @brief Contiene l'implementazione del SERVER.
+#include<stdlib.h>
+#include "err_exit.h"
+#include "defines.h"
+#include "shared_memory.h"
+#include "semaphore.h"
+#include "fifo.h"
+#include "signal.h"  // L' abbiamo incluso noi
+#define ACK_LLEN 100  // Lunghezza lista ack
+#define NUM_DEVICE 5  // Dimensione del vettore che contiene i pid dei device
+#define PREF_PATHFIFO /tmp/dev_fifo.  // Prefisso del path delle fifo
+#define PATHFIFO_LENGTH 20  // Lunghezza del pathname delle fifo
 
-int main(int argc, char** argv){
-  DIR *dir;
-  struct dirent *ent;
-  int i, fd_self, fd;
-  unsigned long time, stime;
-  char flag, *tty;
-  char cmd[256], tty_self[256], path[256], time_s[256];
-  FILE* file;
+#define FIFO_PID_DEVICES tmp/serverToDev_fifo //path file usato come fifo per passare a tutti i devices il pid dei fratelli
 
-  dir = opendir("/proc");
-  fd_self = open("/proc/self/fd/0", O_RDONLY);
-  sprintf(tty_self, "%s", ttyname(fd_self));
-  printf(FORMAT, "PID", "TTY", "TIME", "CMD");
+// Inizializzazione del vettore contenente i pid dei figli(device)
+pid_t pid_device[NUM_DEVICE];
 
-  while ((ent = readdir(dir)) != NULL)
-  {
-  flag = 1;
-  for (i = 0; ent->d_name[i]; i++)
-  if (!isdigit(ent->d_name[i]))
-  { 
-   flag = 0;
-   break;
+int fd_fifo_device[5]; //0 in scrittura, 1,2,3,4 in lettura
+
+char * PATH_FIFO_DEVICES[5]; //vettore che contiene i PATH delle FIFO del 5 device
+
+
+// Chiusura di tutti i processi
+void chiusuraServer(){
+
+  //Ripristino della maschera dei segnali
+
+  printf("Ripristino maschera dei segnali: ");
+  if(sigprocmask(SIG_SETMASK, &default_serverSet, NULL) == -1)
+    errExit("Errore nel ripristino della maschera del Server! \n");
+  else
+    printf("Completato! \n");
+
+  //Chiusura shared memory dell'ack manager
+
+  printf("Chiusura ack manager: ");
+  if (shmctl(SHM_ACK, IPC_RMID, NULL) == -1)
+    errExit("Errore nella cancellazione del segmeto di shared memory dell'ack manager! \n");
+  else
+    printf("Completato! \n");
+
+
+  //Chiusura shared memory della board
+
+  printf("Chiusura della board: ");
+  if (shmctl(SHM_BOARD, IPC_RMID, NULL) == -1)
+    errExit("Errore nella cancellazione del segmeto di shared memory della board! \n");
+  else
+    printf("Completato! \n");
+
+  //Chiusura del set dei semafori per i device
+
+  printf("Chiusura Set dei semafori: ");
+  if(semctl(SEM_IDX_BOARD, 0 , IPC_RMID, NULL) == -1)
+    errExit("Errore nella cancellazione del set di semafori dei device! \n");
+  else
+    printf("Completato!\n");
+
+  //Chiusura del set dei semafori per l'ack manager
+
+  printf("Chiusura Set dei semafori: ");
+  if(semctl(SEM_IDX_ACK, 0 , IPC_RMID, NULL) == -1)
+    errExit("Errore nella cancellazione del set di semafori dell'ack manager! \n");
+  else
+    printf("Completato!\n");
+
+
+}
+
+//Handler comunicazione Server( Accetta solo SIG_TERM )
+void serverHandler ( int signal ){
+  printf("Il segnale SIG_TERM è stato ricevuto, chiusura forzata di tutti i processi!");
+  //Terminazione dei processi figli(device)
+  int i = 0;
+  while(i  < NUM_DEVICE){
+    if(kill(pid_device[i], SIG_TERM) == -1)
+      errExit("Errore nell'annientamento del device %i con pid: %i! \n", i, pid_device[i]);
+    i++;
+  }
+  //Removing FIFO
+  unlink(pathname_fifo[]);
+  close(fifo_fd_mydevice[]);
+  //altre operazioni di chiusura
+  chiusuraServer();
+}
+
+// Handler per i Device( SIG_TERM )
+void deviceHandler ( int signal ){
+  printf("Il segnale SIG_TERM è stato ricevuto, chiusura forzata del device %i!", getpid());
+  //Chiudiamo tutti i fd aperti dal processo e facciamo l'unlink solamente della fifo di questo device
+  for(int i = 0; i < 5; i++){
+    if(pid_device[i] == getpid())
+      unlink(PATH_FIFO_DEVICES[i]);
+    close(fd_fifo_device[i]);
+  }
+  //kill al server
+  if(kill(getppid(), SIG_TERM) == -1)
+    errExit("Errore nell'annientamento del server con pid: %i! \n", getppid());
+}
+
+int main(int argc, char * argv[]) {
+
+  // Controllo argomenti da linea di comando
+  // Il programma vuole una msg_queue_key e un path alla posizione del file
+  if (argc != 3) {
+    printf("Usage: %s  msg_queue_key file_posizioni \n", argv[0]);
+    return 0;
   }
 
-  if (flag)
-  {
-  sprintf(path, "/proc/%s/fd/0", ent->d_name);
-  fd = open(path, O_RDONLY);
-  tty = ttyname(fd);
+  //Ottengo la message queue key e la converto da stringa a int
+  int msgq_key = atoi(argv[1]);
+  //Ottengo il path del file posizione
+  char* pos_file = argv[2];
 
-  if (tty && strcmp(tty, tty_self) == 0)
-  {
+// INIZIO - SEGNALI ----------------------------------------------------------
+  //Settaggio segnali
 
-   sprintf(path, "/proc/%s/stat", ent->d_name);
-   file = fopen(path, "r");
-   fscanf(file, "%d%s%c%c%c", &i, cmd, &flag, &flag, &flag);
-   cmd[strlen(cmd) - 1] = '\0';
+  sigset_t serverSet, default_serverSet;
 
-  for (i = 0; i < 11; i++)
-  fscanf(file, "%lu", &time);
-  fscanf(file, "%lu", &stime);
-  time = (int)((double)(time + stime) / sysconf(_SC_CLK_TCK));
-  sprintf(time_s, "%02lu:%02lu:%02lu",
-  (time / 3600) % 3600, (time / 60) % 60, time % 60);
- 
-  printf(FORMAT, ent->d_name, tty + 5, time_s, cmd + 1);
-  fclose(file);
+  if(sigfillset(&serverSet) == -1)
+    errExit("Errore: sigfillset(serverSet)!");
+
+  if(sigdelset(&serverSet, SIG_TERM) == -1)
+    errExit("Errore nell'eliminazione di SIG_TERM da serverSet!");
+
+  if(sigprocmask(SIG_SETMASK, &serverSet, &defaul_serverSet) == -1)
+    errExit("Errore nel settaggio della maschera dei segnali del Server!");
+
+  //Handler di SIG_TERM
+  if(signal(SIG_TERM, serverHandler) == SIG_ERR)
+    errExit("Caricamento di serverHandler fallito!");
+
+// FINE - SEGNALI -------------------------------------------------------------
+
+
+// INIZIO - SHARED MEMORY -----------------------------------------------------
+  //Creazione della board, con una Shared Mem di pid_t 10x10, usiamo un array come una matrice
+  int SHM_BOARD;
+  SHM_BOARD = alloc_shared_memory(0 , sizeof(pid_t board[10*10]));
+
+  //attach di SHM_BOARD in lettura/scrittura
+  int * pt_board =  (int *)get_shared_memory(SHM_BOARD, 0);
+  if(pt_board == (void *)-1)
+    errExit("Errore nell'attach della board!");
+
+  //Creazione Shared Mem per la lista degli ack
+  int SHM_ACK = alloc_shared_memory(0, sizeof(Acknolegment ack[ACK_LLEN]));
+
+  //attach di SHM_ACK in lettura/scrittura
+  int * pt_ack_list = (int *)get_shared_memory(SHM_ACK, 0);
+  if(pt_ack_list == ((void*)-1))
+    errExit("Errore nell'attach della lista degli ack!!");
+// FINE - SHARED MEMORY -------------------------------------------------------
+
+// INIZIO - SEMAFORI ----------------------------------------------------------
+  //Creazione set semafori Device
+  int SEM_IDX_BOARD = semget(IPC_PRIVATE, 6, S_IRUSR | S_IWUSR);
+
+  if(SEM_IDX_BOARD == -1)
+    errExit("Errore nella creazione del set dei semafori della board!");
+
+  //Creazione set semafori ACK manager
+  int SEM_IDX_ACK = semget(IPC_PRIVATE, 1, S_IRUSR | S_IWUSR);
+
+  if(SEM_IDX_ACK == -1)
+    errExit("Errore nella creazione del set dei semafori dell'ack manager!");
+
+  //Inizializzazione semafori Device
+  unsigned short values[] = {0,0,0,0,0,1};
+  union semun arg;
+  arg.array = values;
+
+  if(semctl(SEM_IDX_BOARD, 0, SETALL, arg) == -1)
+    errExit("Errore nel settare i semafori dei Device!");
+
+  //Inizializzazione semaforo dell'ACK manager
+  unsigned short values_ack[] = {0};
+  arg.array = values_ack;
+
+  if(semctl(SEM_IDX_ACK, 0, SETALL, arg) == -1)
+    errExit("Errore nel settare il semaforo dell'ACK manager!");
+// FINE - SEMAFORI ------------------------------------------------------------
+
+// INIZIO - FIFO PER PASSAGGIO PID AI DEVICE ----------------------------------
+  //creaiamo file per usarlo come fifo
+  if(open(FIFO_PID_DEVICES, O_RDWR | O_CREAT | O_EXCL, S_IRUSR|S_IWUSR ) == -1){
+    printf("Creazione file %s", FIFO_PID_DEVICES);
+    errExit("Errore nella creazione della fifo del device! \n" );
   }
- close(fd);
-}
-}
-close(fd_self);
-return 0;
+  //creaiamo una fifo sul file appena creato
+  if(mkfifo(FIFO_PID_DEVICES, S_IRUSR|S_IWUSR ) == -1){
+    printf("Device con PID: %i - ", getpid());
+    errExit("Errore nella creazione della fifo del device! \n" );
+  }
+  //apriamo la fifo in scrittura (per poi scrivere i pid dei devices)
+  int fd_fifo_pid_devices; //sara' il fd della fifo
+  if(fd_fifo_pid_devices = open(FIFO_PID_DEVICES, O_WRONLY) == -1){
+    printf("Apertura FIFO %s", FIFO_PID_DEVICES);
+    errExit("Errore nella creazione della fifo del device! \n" );
+  }
+// FINE - FIFO PER PASSAGGIO PID AI DEVICE ------------------------------------
+
+// INIZIO - PROCESSI FIGLI ----------------------------------------------------
+  pid_t = pid;
+
+  pid = fork();
+  if(pid == -1)
+    errExit("Errore creazione processo ack");
+// INIZIO - ACK MANAGER -------------------------------------------------------
+  else if(pid == 0){
+    /* Inserire codice dell'ack manager
+     *
+     */
+  }
+// FINE - ACK MANAGER ---------------------------------------------------------
+
+  //Ciclo che crea i processi Device
+  int child;
+  for (child = 0 ; child < 5 ; child ++) {
+    pid = fork();
+    if (pid == -1)
+      errExit("Errore creazione processo Child %d", child);
+
+    // INIZIO - DEVICE ------------------------------------------------------------
+    else if(pid == 0){
+
+      //Una P() sul semaforo del device
+      semOp(SEM_IDX_BOARD, child , -1);
+      
+
+      //lettura pid da fifo lato server e mettili in un array
+      int br = read(fd_fifo_pid_devices, pid_device, sizeof(pid_device));
+      if(br == -1)
+        errExit("Errore di lettura da FIFO_PID_DEVICES!\n");
+      else if(br < sizeof(pid_device))
+        errExit("Non sono stati letti tutti i bytes da FIFO_PID_DEVICES!!");
+
+      //Funzione che crea i path delle fifo
+      for(int c = 0; c < 5; c++){
+        sprintf(PATH_FIFO_DEVICES[c], "%s%i", PREF_PATHFIFO, pid_device[c]);
+      }
+
+      // Creazione FIFO del device
+      if(mkfifo(PATH_FIFO_DEVICES[child], S_IRUSR|S_IWUSR ) == -1){
+        printf("Device con PID: %i - ", getpid());
+        errExit("Errore nella creazione della fifo del device! \n" );
+      }
+
+      // Apriamo la fifo in scrittura sul file
+      fd_fifo_device[0] = open(PATH_FIFO_DEVICES[child], O_WRONLY);
+      if(fd_fifo_device[0] == -1){
+        printf("Device con PID: %i - ", getpid());
+        errExit("Errore nell'apertura della FIFO del device! \n");
+      }
+
+      //Apriamo le 4 fifo in lettura
+      int i;
+      for(i = 0; i < 5 ; i++){
+        if(pid_device[i] != getpid()){
+          fd_fifo_device[i] = open(PATH_FIFO_DEVICES[i], O_RDONLY | O_NONBLOCK);
+          if(fd_fifo_device[i] == -1){
+            printf("Device con PID: %i - ",PATH_FIFO_DEVICES[i]);
+            errExit("Errore nell'apertura della FIFO del device! \n");
+          }
+        }
+      }
+
+      //Handler di SIG_TERM che deve anche chiudere FIFO
+      if(signal(SIG_TERM, deviceHandler()) == SIG_ERR)
+     	  errExit("Caricamento di deviceHandler fallito!");
+
+
+
+
+      // V() del prossimo device, se è il quinto fa ripartire il primo
+      if(child != 4)
+        semOp(SEM_IDX_BOARD, child+1 , 1);
+      else
+        semOp(SEM_IDX_BOARD, 0 , 1);
+
+
+      while(TRUE){
+        // P() del device
+        semOp(SEM_IDX_BOARD, child , -1);
+
+      /* Codice eseguito dai device
+           Ordine operazioni svolte dai device:
+           1- Invio del proprio messaggio ai vicini(se disponibili)
+           2- Ricezione dei messaggi dai vicini
+           3- Movimento
+      */
+
+      // V() del prossimo device, se è il quinto fa ripartire il primo
+        if(child != 4)
+          semOp(SEM_IDX_BOARD, child+1 , 1);
+        else
+          semOp(SEM_IDX_BOARD, 0 , 1);
+
+      }
+
+    }
+    // FINE - DEVICE --------------------------------------------------------------
+
+    else {
+      // Inserimento valori pid dei device nel vettore
+      pid_device[child] = pid;
+    }
+  }
+
+	if(write(fd_fifo_pid_devices, pid_device, sizeof(pid_device)) == -1)
+  	errExit("Errore della scrittura dei pid su FIFO_PID_DEVICES!\n");
+
+  //V() del primo device per far partire l'inizializzazione
+   semOp(SEM_IDX_BOARD, 0 , 1);
+
+// FINE - PROCESSI FIGLI ------------------------------------------------------
+
+  //Attesa che tutti i figli terminino
+  pid_t Child_pid;
+  while((Child_pid = wait(NULL)) != -1);
+  if(errno == ECHILD)
+      errExit("Errore inaspettato nell'operazione WAIT!!");
+
+  // Chiusura di tutti i processi aperti
+  chiusuraServer();
+
+  return 0;
 }
